@@ -1,49 +1,49 @@
 use std::{
     sync::Arc,
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use alloy_json_rpc::{Id, Response, SerializedRequest};
 use crossbeam::channel::{self, Sender};
 use dashmap::DashMap;
+use hdrhistogram::Histogram;
 
-use crate::{connection::IpcConnectionHandle, errors::TransportError};
-
-//TODO:
-// This is more or less how I see this, probably missing some details, I think I got it like 80%
-// right
-//1. Keep track of all requests HashMap<Id, OneShotChannel>
-//2. To send request we:
-//  2.1 Using channel send part from Manager send data to IPC
-//  2.2 Which means IPC needs to have receiver part of this channel
-//  2.3 We then crate (sender, receiver) = OneShotChannel::new()
-//  2.3 We insert to hashmap <Id, OneShotChannel::Sender>
-//  2.4 Wait on OneShotChannel::Receiver to get resposnse
-//  2.5 Return response
-//  2.6 Maybe timeout, I think on timeout we just remove from the map
-//3. To receive response we:
-//  3.1 need to have loop which listens to new responses from IPC
-//  3.2 this means that Manager holds receiver part to get data from IPC and IPC holds sender part
-//    (inverse from the above)
-//  3.2 when response is received we check the HashMap and try to get response by id, on success
-//  3.3 se send response to one shot channel
-//  It looks to me I'll need one more layer here one "real" manager  and smht. I inject to IPC
-//  (currently incorrectly called Manager)
+use crate::{
+    connection::IpcConnectionHandle, errors::TransportError, pending_request::PendingRequest,
+};
 
 #[derive(Clone)]
 pub(crate) struct ReManager {
-    requests: Arc<DashMap<Id, Sender<Response>>>,
+    requests: Arc<DashMap<Id, PendingRequest>>,
     connection: IpcConnectionHandle,
 
     to_send: Sender<Option<SerializedRequest>>,
+
+    #[cfg(feature = "metrics")]
+    send_to_metrics_channel: Sender<Option<Duration>>,
 }
 
 impl ReManager {
+    #[cfg(not(feature = "metrics"))]
     fn new(connection: IpcConnectionHandle, send: Sender<Option<SerializedRequest>>) -> Self {
         Self {
             connection,
             to_send: send,
+            requests: Arc::new(DashMap::new()),
+        }
+    }
+
+    #[cfg(feature = "metrics")]
+    fn new_with_metrics(
+        connection: IpcConnectionHandle,
+        send: Sender<Option<SerializedRequest>>,
+        send_to_metrics_channel: Sender<Option<Duration>>,
+    ) -> Self {
+        Self {
+            connection,
+            to_send: send,
+            send_to_metrics_channel,
             requests: Arc::new(DashMap::new()),
         }
     }
@@ -61,6 +61,13 @@ impl ReManager {
         JoinHandle<Result<(), TransportError>>,
     ) {
         let (sender, receiver) = channel::unbounded();
+
+        #[cfg(feature = "metrics")]
+        let (metrics_send, metrics_recv) = channel::unbounded();
+        #[cfg(feature = "metrics")]
+        let manager = ReManager::new_with_metrics(connection, sender, metrics_send);
+
+        #[cfg(not(feature = "metrics"))]
         let manager = ReManager::new(connection, sender);
 
         let (rec, send) = (manager.clone(), manager.clone());
@@ -76,19 +83,24 @@ impl ReManager {
             Ok(())
         });
 
+        #[cfg(feature = "metrics")]
+        thread::spawn(move || {
+            ReManager::metrics_loop(metrics_recv);
+        });
+
         //TODO: this is FUGLY fix it
         (manager, rec_jh, send_jh)
     }
 
     pub(crate) fn send(&self, req: SerializedRequest) -> Result<Response, TransportError> {
-        let (s, r) = channel::bounded::<Response>(1);
+        let (recv, pending_req) = PendingRequest::new();
         let id = req.id().clone();
 
         self.to_send.send(Some(req))?;
         // Only insert after we are sure that it was sent (at least) to the channel
-        self.requests.insert(id, s);
+        self.requests.insert(id, pending_req);
 
-        let r = r.recv()?;
+        let r = recv.recv()?;
         Ok(r)
     }
 
@@ -97,15 +109,15 @@ impl ReManager {
         req: SerializedRequest,
         timeout: Duration,
     ) -> Result<Response, TransportError> {
-        let (s, r) = channel::bounded::<Response>(1);
+        let (recv, pending_req) = PendingRequest::new();
         let id = req.id().clone();
         let del_id = req.id().clone();
 
         self.to_send.send(Some(req))?;
         // Only insert after we are sure that it was sent (at least) to the channel
-        self.requests.insert(id, s);
+        self.requests.insert(id, pending_req);
 
-        let r = match r.recv_timeout(timeout) {
+        let r = match recv.recv_timeout(timeout) {
             Ok(r) => r,
             Err(e) => {
                 //TODO: add retry logic
@@ -132,9 +144,17 @@ impl ReManager {
     fn receive_loop(&self) -> Result<(), TransportError> {
         while let Ok(Some(resp)) = self.connection.recv() {
             if let Some((_, pending_req)) = self.requests.remove(&resp.id) {
-                pending_req.send(resp)?;
+                pending_req.notify(resp)?;
+
+                #[cfg(feature = "metrics")]
+                let _ = self
+                    .send_to_metrics_channel
+                    .send(Some(pending_req.record_metric()));
             }
         }
+
+        #[cfg(feature = "metrics")]
+        let _ = self.send_to_metrics_channel.send(None);
 
         self.drop_all_pending_requests();
         Ok(())
@@ -151,6 +171,53 @@ impl ReManager {
         {
             if let Some((_, pending_req)) = self.requests.remove(&k) {
                 drop(pending_req);
+            }
+        }
+    }
+
+    #[cfg(feature = "metrics")]
+    fn metrics_loop(recv_metircs: channel::Receiver<Option<Duration>>) {
+        let mut last_time_logged = Instant::now();
+        // range is from 1 micro_sec to 1s (1000 micro sec in 1 milisec and 1000 milisec in 1 sec)
+        let mut histogram: Histogram<u64> =
+            hdrhistogram::Histogram::new_with_bounds(1, 1000 * 1000, 3)
+                .expect("Failed to create histogram");
+
+        while let Ok(Some(duration)) = recv_metircs.recv() {
+            if let Ok(d) = duration.as_micros().try_into() {
+                if let Err(e) = histogram.record(d) {
+                    println!("IPC Failed to record metric: {}", e);
+                }
+            } else {
+                println!(
+                    "IPC  Failed to record metric: duration too big {}",
+                    duration.as_secs()
+                );
+            }
+
+            let log_on_interval = last_time_logged.elapsed().as_secs() >= 180;
+            if log_on_interval {
+                let f = format!(
+                    r#"*************************************************
+                       *************************************************
+                           * MAX: {} micro_sec
+                           * MEDIAN: {} micro_sec
+                           * AVERAGE: {} micro_sec
+                           * TAIL LATENCY:
+                           * 90%ile: {} micro_sec
+                           * 95%ile: {} micro_sec
+                           * 99%ile: {} micro_sec
+                       ****************************************************
+                       ****************************************************"#,
+                    histogram.max(),
+                    histogram.value_at_quantile(0.5),
+                    histogram.mean(),
+                    histogram.value_at_quantile(0.9),
+                    histogram.value_at_quantile(0.95),
+                    histogram.value_at_quantile(0.99)
+                );
+                println!("{}", f);
+                last_time_logged = Instant::now();
             }
         }
     }
